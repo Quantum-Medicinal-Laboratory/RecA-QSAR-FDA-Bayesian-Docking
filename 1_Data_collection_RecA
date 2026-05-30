@@ -1,0 +1,428 @@
+# Data Collection and Curation of *Mycobacterium tuberculosis* RecA EC50 Bioactivity Data from ChEMBL
+
+This notebook is a publication-ready data collection workflow adapted from the original dengue virus type 2 NS3 protein notebook and combined with the RecA ChEMBL EC50 workflow.
+
+**Target used in this notebook**
+
+- Target: *Mycobacterium tuberculosis* RecA protein
+- ChEMBL target ID: `CHEMBL1741171`
+- Bioactivity endpoint: `EC50`
+- Standard unit: `nM`
+- Accepted relation: exact values only (`standard_relation == "="`)
+
+**Main outputs**
+
+The workflow generates raw, filtered, curated, labeled, binary, balanced, and summary CSV files inside:
+
+`outputs/recA_chembl/`
+
+## 1. Install required libraries
+# Run this cell in Google Colab if the ChEMBL client is not installed.
+# In local Jupyter, you may also run it once.
+!pip -q install chembl_webresource_client pandas
+
+## 2. Import libraries and define configurationfrom __future__ import annotations
+
+import math
+from pathlib import Path
+from typing import Iterable
+
+import pandas as pd
+from chembl_webresource_client.new_client import new_client
+
+
+# ============================================================
+# Project configuration
+# ============================================================
+
+TARGET_SEARCH_QUERY = "RecA Mycobacterium tuberculosis"
+TARGET_CHEMBL_ID = "CHEMBL1741171"
+TARGET_PREF_NAME = "Protein RecA"
+TARGET_ORGANISM = "Mycobacterium tuberculosis"
+
+STANDARD_TYPE = "EC50"
+STANDARD_UNIT = "nM"
+STANDARD_RELATION = "="
+
+ACTIVE_THRESHOLD_NM = 1000
+INACTIVE_THRESHOLD_NM = 10000
+RANDOM_STATE = 42
+MOLECULE_BATCH_SIZE = 100
+
+OUTPUT_DIR = Path("outputs") / "recA_chembl"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+## 3. Search and select the RecA target
+
+This section follows the same logic as the original NS3 notebook: first search the ChEMBL target table, then select the correct biological target.  
+For publication-quality reproducibility, this notebook does **not** rely only on the first search result. It prioritizes the validated ChEMBL target ID `CHEMBL1741171`.
+
+def search_targets(query: str = TARGET_SEARCH_QUERY) -> pd.DataFrame:
+    """Search ChEMBL target records using a keyword query."""
+    target_client = new_client.target
+    records = list(target_client.search(query))
+
+    if not records:
+        raise RuntimeError(f"No ChEMBL target records found for query: {query}")
+
+    targets = pd.DataFrame.from_dict(records)
+    targets.to_csv(OUTPUT_DIR / "recA_target_search_hits.csv", index=False)
+    return targets
+
+
+def select_reca_target(targets: pd.DataFrame) -> pd.Series:
+    """Select the intended M. tuberculosis RecA target from ChEMBL search results."""
+    required_columns = {"target_chembl_id", "pref_name", "organism"}
+    missing = required_columns.difference(targets.columns)
+
+    if missing:
+        raise ValueError(f"Target search result is missing columns: {sorted(missing)}")
+
+    selected = targets[targets["target_chembl_id"] == TARGET_CHEMBL_ID]
+
+    if selected.empty:
+        selected = targets[
+            (targets["pref_name"].astype(str).str.contains("RecA", case=False, na=False))
+            & (targets["organism"].astype(str) == TARGET_ORGANISM)
+        ]
+
+    if selected.empty:
+        raise RuntimeError(
+            "The expected RecA target was not found. "
+            "Please inspect outputs/recA_chembl/recA_target_search_hits.csv."
+        )
+
+    selected_target = selected.iloc[0]
+    pd.DataFrame([selected_target.to_dict()]).to_csv(
+        OUTPUT_DIR / "recA_selected_target.csv",
+        index=False,
+    )
+    return selected_target
+
+
+targets = search_targets()
+selected_target = select_reca_target(targets)
+
+print("Selected target")
+print("---------------")
+print(f"Target ChEMBL ID : {selected_target['target_chembl_id']}")
+print(f"Preferred name   : {selected_target['pref_name']}")
+print(f"Organism         : {selected_target['organism']}")
+
+targets.head()
+
+## 4. Retrieve RecA EC50 bioactivity records
+
+This section retrieves ChEMBL bioactivity records for the selected RecA target and keeps only exact EC50 records in nM.
+
+def fetch_activities(target_chembl_id: str) -> pd.DataFrame:
+    """Retrieve raw ChEMBL activity records for a target."""
+    fields = [
+        "activity_id",
+        "assay_chembl_id",
+        "assay_description",
+        "canonical_smiles",
+        "document_chembl_id",
+        "molecule_chembl_id",
+        "pchembl_value",
+        "published_type",
+        "published_units",
+        "published_value",
+        "standard_relation",
+        "standard_type",
+        "standard_units",
+        "standard_value",
+        "target_chembl_id",
+    ]
+
+    activity_client = new_client.activity
+    records = list(
+        activity_client
+        .filter(target_chembl_id=target_chembl_id)
+        .only(fields)
+    )
+
+    if not records:
+        raise RuntimeError(f"No activity records found for target: {target_chembl_id}")
+
+    raw = pd.DataFrame.from_dict(records)
+    raw.to_csv(OUTPUT_DIR / "recA_activities_raw.csv", index=False)
+    return raw
+
+
+def filter_exact_ec50_nm(raw: pd.DataFrame) -> pd.DataFrame:
+    """Keep exact EC50 records reported in nM and compute pEC50."""
+    df = raw.copy()
+
+    df["standard_value"] = pd.to_numeric(df["standard_value"], errors="coerce")
+    df["pchembl_value"] = pd.to_numeric(df["pchembl_value"], errors="coerce")
+
+    ec50 = df[
+        (df["standard_type"] == STANDARD_TYPE)
+        & (df["standard_units"] == STANDARD_UNIT)
+        & (df["standard_relation"] == STANDARD_RELATION)
+        & df["standard_value"].notna()
+        & (df["standard_value"] > 0)
+    ].copy()
+
+    ec50["standard_value_nM"] = ec50["standard_value"]
+    ec50["pEC50"] = ec50["standard_value_nM"].map(lambda x: 9 - math.log10(x))
+
+    ec50.to_csv(OUTPUT_DIR / "recA_activities_ec50_exact.csv", index=False)
+    return ec50
+
+
+raw_activities = fetch_activities(selected_target["target_chembl_id"])
+ec50_activities = filter_exact_ec50_nm(raw_activities)
+
+print(f"Raw activity records       : {len(raw_activities)}")
+print(f"Exact EC50 records in nM   : {len(ec50_activities)}")
+
+ec50_activities.head()
+
+## 5. Retrieve molecule metadata
+
+This optional but useful section retrieves molecule-level metadata and physicochemical properties from ChEMBL.
+
+def chunked(values: list[str], size: int) -> Iterable[list[str]]:
+    for index in range(0, len(values), size):
+        yield values[index:index + size]
+
+
+def fetch_molecule_metadata(molecule_ids: list[str]) -> pd.DataFrame:
+    """Retrieve ChEMBL molecule metadata in batches."""
+    if not molecule_ids:
+        return pd.DataFrame()
+
+    fields = [
+        "molecule_chembl_id",
+        "pref_name",
+        "max_phase",
+        "molecule_type",
+        "structure_type",
+        "molecule_structures",
+        "molecule_properties",
+    ]
+
+    all_records = []
+    molecule_client = new_client.molecule
+
+    for batch in chunked(molecule_ids, MOLECULE_BATCH_SIZE):
+        batch_records = list(
+            molecule_client
+            .filter(molecule_chembl_id__in=batch)
+            .only(fields)
+        )
+        all_records.extend(batch_records)
+
+    rows = []
+    for record in all_records:
+        structures = record.get("molecule_structures") or {}
+        properties = record.get("molecule_properties") or {}
+
+        rows.append({
+            "molecule_chembl_id": record.get("molecule_chembl_id"),
+            "molecule_pref_name": record.get("pref_name"),
+            "max_phase": record.get("max_phase"),
+            "molecule_type": record.get("molecule_type"),
+            "structure_type": record.get("structure_type"),
+            "metadata_canonical_smiles": structures.get("canonical_smiles"),
+            "standard_inchi_key": structures.get("standard_inchi_key"),
+            "full_mwt": properties.get("full_mwt"),
+            "alogp": properties.get("alogp"),
+            "psa": properties.get("psa"),
+            "hba": properties.get("hba"),
+            "hbd": properties.get("hbd"),
+            "rtb": properties.get("rtb"),
+            "aromatic_rings": properties.get("aromatic_rings"),
+            "cx_logp": properties.get("cx_logp"),
+        })
+
+    metadata = (
+        pd.DataFrame(rows)
+        .drop_duplicates(subset=["molecule_chembl_id"])
+        .reset_index(drop=True)
+    )
+
+    metadata.to_csv(OUTPUT_DIR / "recA_molecule_metadata.csv", index=False)
+    return metadata
+
+
+molecule_ids = (
+    ec50_activities["molecule_chembl_id"]
+    .dropna()
+    .drop_duplicates()
+    .tolist()
+)
+
+molecule_metadata = fetch_molecule_metadata(molecule_ids)
+
+print(f"Unique molecules with metadata: {len(molecule_metadata)}")
+molecule_metadata.head()
+
+## 6. Data processing and bioactivity labeling
+
+This section keeps the original structure of the dengue NS3 notebook but applies it correctly to RecA EC50 data.
+
+Labeling rule used here:
+
+- `active`: EC50 ≤ 1,000 nM
+- `intermediate`: 1,000 nM < EC50 < 10,000 nM
+- `inactive`: EC50 ≥ 10,000 nM
+
+For machine-learning classification, intermediate compounds are removed to form a clearer binary dataset.
+
+def process_and_label_ec50(ec50_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Clean, deduplicate, label, and generate binary RecA EC50 datasets."""
+    required_columns = ["molecule_chembl_id", "canonical_smiles", "standard_value"]
+    missing = [column for column in required_columns if column not in ec50_df.columns]
+
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+
+    df = ec50_df.copy()
+    df["standard_value"] = pd.to_numeric(df["standard_value"], errors="coerce")
+
+    nonnull = df[
+        df["standard_value"].notna()
+        & df["canonical_smiles"].notna()
+    ].copy()
+
+    nonnull["normalized_smiles"] = nonnull["canonical_smiles"].astype(str).str.strip()
+
+    deduplicated = (
+        nonnull
+        .sort_values(["standard_value", "molecule_chembl_id"], ascending=[True, True])
+        .drop_duplicates(subset=["normalized_smiles"], keep="first")
+        .reset_index(drop=True)
+    )
+
+    curated = deduplicated[
+        ["molecule_chembl_id", "canonical_smiles", "standard_value", "standard_value_nM", "pEC50"]
+    ].copy()
+
+    curated["bioactivity_class"] = "intermediate"
+    curated.loc[curated["standard_value"] <= ACTIVE_THRESHOLD_NM, "bioactivity_class"] = "active"
+    curated.loc[curated["standard_value"] >= INACTIVE_THRESHOLD_NM, "bioactivity_class"] = "inactive"
+
+    binary = curated[curated["bioactivity_class"].isin(["active", "inactive"])].copy()
+    binary["class"] = binary["bioactivity_class"].map({"inactive": 0, "active": 1}).astype(int)
+
+    active = binary[binary["bioactivity_class"] == "active"].copy()
+    inactive = binary[binary["bioactivity_class"] == "inactive"].copy()
+
+    target_n = min(len(active), len(inactive))
+    if target_n > 0:
+        balanced = (
+            pd.concat([
+                active.sample(n=target_n, random_state=RANDOM_STATE),
+                inactive.sample(n=target_n, random_state=RANDOM_STATE),
+            ], axis=0)
+            .sample(frac=1, random_state=RANDOM_STATE)
+            .reset_index(drop=True)
+        )
+    else:
+        balanced = pd.DataFrame(columns=binary.columns)
+
+    return nonnull, deduplicated, curated, binary, balanced
+
+
+nonnull, deduplicated, curated, binary, balanced = process_and_label_ec50(ec50_activities)
+
+nonnull.to_csv(OUTPUT_DIR / "recA_ec50_nonnull.csv", index=False)
+deduplicated.to_csv(OUTPUT_DIR / "recA_ec50_deduplicated.csv", index=False)
+curated.to_csv(OUTPUT_DIR / "recA_ec50_labeled.csv", index=False)
+binary.to_csv(OUTPUT_DIR / "recA_ec50_binary.csv", index=False)
+balanced.to_csv(OUTPUT_DIR / "recA_ec50_binary_balanced_50_50.csv", index=False)
+
+print(f"After removing missing values : {len(nonnull)}")
+print(f"After SMILES deduplication    : {len(deduplicated)}")
+print(f"Final binary dataset          : {len(binary)}")
+print(f"Balanced 50:50 dataset        : {len(balanced)}")
+
+print("\nBioactivity class counts:")
+print(curated["bioactivity_class"].value_counts().to_string())
+
+curated.head()
+
+## 7. Create publication-style data summary and final ML dataset
+
+def create_activity_summary(curated_df: pd.DataFrame) -> pd.DataFrame:
+    """Create one-row-per-compound activity summary for modeling/reporting."""
+    summary = (
+        curated_df
+        .groupby("molecule_chembl_id", as_index=False)
+        .agg(
+            canonical_smiles=("canonical_smiles", "first"),
+            median_ec50_nM=("standard_value", "median"),
+            min_ec50_nM=("standard_value", "min"),
+            max_ec50_nM=("standard_value", "max"),
+            median_pEC50=("pEC50", "median"),
+            bioactivity_class=("bioactivity_class", "first"),
+        )
+        .sort_values(["median_pEC50", "min_ec50_nM"], ascending=[False, True])
+        .reset_index(drop=True)
+    )
+
+    return summary
+
+
+activity_summary = create_activity_summary(curated)
+activity_summary.to_csv(OUTPUT_DIR / "recA_activity_summary_ml.csv", index=False)
+
+ml_dataset = activity_summary.merge(
+    molecule_metadata,
+    on="molecule_chembl_id",
+    how="left",
+)
+
+ml_dataset.to_csv(OUTPUT_DIR / "recA_ml_dataset.csv", index=False)
+
+data_curation_summary = pd.DataFrame([
+    {"step": "Raw ChEMBL activity records", "records": len(raw_activities)},
+    {"step": "Exact EC50 records in nM", "records": len(ec50_activities)},
+    {"step": "After removing missing standard_value/canonical_smiles", "records": len(nonnull)},
+    {"step": "After SMILES deduplication", "records": len(deduplicated)},
+    {"step": "Active compounds", "records": int((curated["bioactivity_class"] == "active").sum())},
+    {"step": "Intermediate compounds", "records": int((curated["bioactivity_class"] == "intermediate").sum())},
+    {"step": "Inactive compounds", "records": int((curated["bioactivity_class"] == "inactive").sum())},
+    {"step": "Final binary active/inactive dataset", "records": len(binary)},
+    {"step": "Balanced 50:50 modeling dataset", "records": len(balanced)},
+])
+
+data_curation_summary.to_csv(OUTPUT_DIR / "01_data_curation_summary.csv", index=False)
+
+data_curation_summary
+
+## 8. Download outputs in Google Colab
+
+# Optional: run this cell in Google Colab to zip and download all output files.
+try:
+    from google.colab import files
+    import shutil
+
+    zip_path = shutil.make_archive("recA_chembl_outputs", "zip", OUTPUT_DIR)
+    files.download(zip_path)
+except Exception as error:
+    print("Download is only available in Google Colab.")
+    print(f"Output files are saved in: {OUTPUT_DIR.resolve()}")
+
+## Expected output files
+
+After running all cells, the main files are:
+
+- `recA_target_search_hits.csv`
+- `recA_selected_target.csv`
+- `recA_activities_raw.csv`
+- `recA_activities_ec50_exact.csv`
+- `recA_molecule_metadata.csv`
+- `recA_ec50_nonnull.csv`
+- `recA_ec50_deduplicated.csv`
+- `recA_ec50_labeled.csv`
+- `recA_ec50_binary.csv`
+- `recA_ec50_binary_balanced_50_50.csv`
+- `recA_activity_summary_ml.csv`
+- `recA_ml_dataset.csv`
+- `01_data_curation_summary.csv`
+
+This version is cleaner than the previous combined file because it avoids repeated `main()` functions, keeps the RecA target explicit, and preserves the step-by-step style of the original NS3 notebook.
